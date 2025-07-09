@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dummy
+spec:
+  template:
+    spec:
+      containers:
+      - manager:
+        image: ghcr.io/tkhq/valkey_manager
+        resources:
+          requests:
+            memory: 50Mi
+        ports:
+        - name: manager
+          containerPort: 8087
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: manager
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: manager
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          readOnlyRootFilesystem: true

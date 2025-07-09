@@ -1,0 +1,43 @@
+name: Pull Request
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  kustomize_build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.4.2
+        with:
+          path: repo
+      - name: kustomize build
+        run: |
+          env -C repo/ kustomize build ./kustomize -o ../manifests.yaml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: manifests-kustomize
+          path: manifests.yaml
+          retention-days: 1
+
+  kubeconform:
+    runs-on: ubuntu-latest
+    needs:
+      - kustomize_build
+    strategy:
+      matrix:
+        kubernetes-version:
+          - 1.33.1
+      fail-fast: false
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: manifests-kustomize
+      - uses: docker://ghcr.io/yannh/kubeconform:v0.7.0-alpine@sha256:8f0eeaaa96ba27ba1500b0e4b1c215acc358d159c62a7ecae58d7a03403287b0
+        with:
+          entrypoint: '/kubeconform'
+          args: >-
+            -strict
+            -kubernetes-version="${{ matrix.kubernetes-version }}"
+            -summary manifests.yaml
