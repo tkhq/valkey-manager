@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"log/slog"
+	"sync"
 
 	v1 "k8s.io/api/apps/v1"
 	"k8s.io/client-go/tools/cache"
@@ -10,6 +11,17 @@ import (
 
 type updateHandler struct {
 	updater func(*v1.StatefulSet)
+
+	clusterConfigured bool
+
+	mu sync.RWMutex
+}
+
+func (h *updateHandler) ClusterConfigured() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	return h.clusterConfigured
 }
 
 func (h *updateHandler) OnAdd(obj any, isInInitialList bool) {
@@ -52,12 +64,30 @@ func (h *updateHandler) OnDelete(_ any) {
 	// Nothing we can do
 }
 
-func UpdateHandler(ctx context.Context, ourIndex int) cache.ResourceEventHandler {
-	return &updateHandler{
-		updater: func(ss *v1.StatefulSet) {
-			if err := Configure(ctx, ss, ourIndex); err != nil {
-				slog.Error("failed to reconfigure cluster after replica count change", slog.String("error", err.Error()))
-			}
-		},
+type ResourceHandler interface {
+	cache.ResourceEventHandler
+
+	// ClusterConfigured indicates the the cluster has been successfully configured.
+	ClusterConfigured() bool
+}
+
+func UpdateHandler(ctx context.Context, ourIndex uint32) ResourceHandler {
+	h := new(updateHandler)
+
+	h.updater = func(ss *v1.StatefulSet) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+
+		if err := Configure(ctx, ss, ourIndex); err != nil {
+			slog.Error("failed to reconfigure cluster after replica count change", slog.String("error", err.Error()))
+
+			h.clusterConfigured = false
+
+			return
+		}
+
+		h.clusterConfigured = true
 	}
+
+	return h
 }

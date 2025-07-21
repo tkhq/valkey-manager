@@ -11,3 +11,4 @@ FROM scratch AS package
 COPY --from=build /app /app
 
 ENTRYPOINT ["/app"]
+CMD []

@@ -5,12 +5,22 @@ metadata:
 spec:
   template:
     spec:
+      serviceAccountName: valkey-manager
       containers:
-      - manager:
-        image: ghcr.io/tkhq/valkey_manager
+      - name: manager
+        image: ghcr.io/tkhq/valkey-manager@sha256:f82446446348824e648ac4deedaa3ba802545b7d19f272995b0aeca7e3e887a3
         resources:
           requests:
             memory: 50Mi
+        env:
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
         ports:
         - name: manager
           containerPort: 8087

@@ -2,8 +2,8 @@ package cluster
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
+	"io"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -29,12 +29,10 @@ const (
 // Info represents the state of the cluster, as seen from a given node.
 type Info map[string]string
 
-func InfoFromString(in string) (Info, error) {
+func InfoFromReader(in io.Reader) (Info, error) {
 	i := Info{}
 
-	b := bytes.NewReader([]byte(in))
-
-	scanner := bufio.NewScanner(b)
+	scanner := bufio.NewScanner(in)
 
 	for scanner.Scan() {
 		pieces := strings.Split(scanner.Text(), ":")

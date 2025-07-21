@@ -3,16 +3,15 @@ module github.com/tkhq/valkey-manager
 go 1.24.4
 
 require (
-	github.com/redis/go-redis/v9 v9.11.0
+	github.com/sethvargo/go-envconfig v1.3.0
+	github.com/valkey-io/valkey-go v1.0.63
 	k8s.io/api v0.33.2
 	k8s.io/apimachinery v0.33.2
 	k8s.io/client-go v0.33.2
 )
 
 require (
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/emicklei/go-restful/v3 v3.11.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect

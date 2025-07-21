@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/valkey-io/valkey-go"
 	v1 "k8s.io/api/apps/v1"
 )
 
@@ -19,17 +19,18 @@ const (
 	TotalSlotCount = 16384
 
 	NodeNamePrefix = "valkey-"
-	ValkeyPort     = 6379
+	NodeNameSuffix = ".valkey"
+
+	ValkeyPort = 6379
 )
 
-func Configure(ctx context.Context, ss *v1.StatefulSet, ourIndex int) error {
+func Configure(ctx context.Context, ss *v1.StatefulSet, ourIndex uint32) error {
 	if ss == nil || ss.Spec.Replicas == nil {
 		return fmt.Errorf("failed to locate replica count; cannot configure cluster")
 	}
 
-	rc := redis.NewClient(nil)
-
-	if err := WaitPing(ctx, rc); err != nil {
+	vc, err := WaitPing(ctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(ValkeyPort)))
+	if err != nil {
 		return fmt.Errorf("failed to wait for local redis ping to succeed: %w", err)
 	}
 
@@ -37,56 +38,72 @@ func Configure(ctx context.Context, ss *v1.StatefulSet, ourIndex int) error {
 
 	primaryCount, _ := primariesAndReplicas(int(*ss.Spec.Replicas))
 
-	if err := EnsureClusterInitialized(ctx, rc, ourIndex, primaryCount); err != nil {
+	if err := EnsureClusterInitialized(ctx, vc, int(ourIndex), primaryCount); err != nil {
 		return fmt.Errorf("failed to ensure cluster is initialized: %w", err)
 	}
 
 	return nil
 }
 
+// primariesAndReplicas splits the total count of instances between primaries and replicas.
+// Primaries are enumerated first as half the total, rounded down, and replicas assigned from the remnant.
+// We number these to ensure that if there are _any_ replicas, their count is at least the same as the primaries, totalCount
+// ensure that each primary has a replica.
 func primariesAndReplicas(totalCount int) (primaries, replicas int) {
-	primaries = (totalCount + 1) / 2
+	primaries = max(1, totalCount/2)
 
-	replicas = (totalCount - primaries) / primaries
-
-	return
+	return primaries, totalCount - primaries
 }
 
-func WaitPing(ctx context.Context, rc redis.UniversalClient) error {
+func WaitPing(ctx context.Context, addr string) (valkey.Client, error) {
 	for {
-		if result := rc.Ping(ctx).String(); result == "PONG" {
-			slog.Debug("local redis is ready")
+		vc, err := valkey.NewClient(valkey.ClientOption{
+			InitAddress:       []string{addr},
+			ForceSingleClient: true,
+		})
+		if err == nil {
+			if err = vc.Do(ctx, vc.B().Ping().Build()).Error(); err == nil {
+				slog.Debug("local redis is ready")
 
-			return nil
+				return vc, nil
+			}
 		}
 
-		slog.Debug("waiting for local redis to become ready", slog.Duration("wait", PingCheckInterval))
+		slog.Debug("waiting for local redis to become ready",
+			slog.Duration("wait", PingCheckInterval),
+			slog.String("error", err.Error()),
+		)
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		case <-time.After(PingCheckInterval):
 		}
 	}
 }
 
-func EnsureClusterInitialized(ctx context.Context, rc redis.UniversalClient, ourIndex int, primaryCount int) error {
+func EnsureClusterInitialized(ctx context.Context, vc valkey.Client, ourIndex int, primaryCount int) error {
 	switch {
 	case ourIndex < primaryCount:
 		slog.Info("configuring ourselves as a primary node", slog.Int64("index", int64(ourIndex)))
 
-		return ConfigurePrimaryNode(ctx, rc, ourIndex, primaryCount)
+		return ConfigurePrimaryNode(ctx, vc, ourIndex, primaryCount)
 	default:
 		slog.Info("configuring ourselves as a replica node", slog.Int64("index", int64(ourIndex)))
 
-		return ConfigureReplicaNode(ctx, rc, ourIndex, primaryCount)
+		return ConfigureReplicaNode(ctx, vc, ourIndex, primaryCount)
 	}
 }
 
-func ConfigurePrimaryNode(ctx context.Context, rc redis.UniversalClient, ourIndex int, primaryCount int) error {
+func ConfigurePrimaryNode(ctx context.Context, vc valkey.Client, ourIndex int, primaryCount int) error {
 	log := slog.With(slog.Int64("index", int64(ourIndex)))
 
-	clusterInfo, err := InfoFromString(rc.ClusterInfo(ctx).String())
+	infoReader, err := vc.Do(ctx, vc.B().ClusterInfo().Build()).AsReader()
+	if err != nil {
+		return fmt.Errorf("failed to read cluster info: %w", err)
+	}
+
+	clusterInfo, err := InfoFromReader(infoReader)
 	if err != nil {
 		return fmt.Errorf("failed to read cluster info: %w", err)
 	}
@@ -107,7 +124,7 @@ func ConfigurePrimaryNode(ctx context.Context, rc redis.UniversalClient, ourInde
 
 		log.Info("setting cluster shard slots", slog.Int("first", firstSlot), slog.Int("last", lastSlot))
 
-		if err := rc.ClusterAddSlotsRange(ctx, firstSlot, lastSlot).Err(); err != nil {
+		if err := vc.Do(ctx, vc.B().ClusterAddslotsrange().StartSlotEndSlot().StartSlotEndSlot(int64(firstSlot), int64(lastSlot)).Build()).Error(); err != nil {
 			return fmt.Errorf("failed to set slot range (%d - %d) on node %d: %w", firstSlot, lastSlot, ourIndex, err)
 		}
 	}
@@ -119,7 +136,17 @@ func ConfigurePrimaryNode(ctx context.Context, rc redis.UniversalClient, ourInde
 
 		log.Info("introducting ourselves to peer", slog.Int64("peer_index", int64(peerIndex)))
 
-		if err := rc.ClusterMeet(ctx, nodeName(peerIndex), strconv.FormatInt(ValkeyPort, 10)).Err(); err != nil {
+		peerIP, err := nodeIP(peerIndex)
+		if err != nil {
+			log.Warn("no IP available for peer",
+				slog.Int64("peer_index", int64(peerIndex)),
+				slog.String("error", err.Error()),
+			)
+
+			continue
+		}
+
+		if err := vc.Do(ctx, vc.B().ClusterMeet().Ip(peerIP.String()).Port(ValkeyPort).Build()).Error(); err != nil {
 			log.Warn("failed to introduce peer",
 				slog.Int64("peer_index", int64(peerIndex)),
 				slog.String("error", err.Error()),
@@ -132,16 +159,17 @@ func ConfigurePrimaryNode(ctx context.Context, rc redis.UniversalClient, ourInde
 	return nil
 }
 
-func ConfigureReplicaNode(ctx context.Context, rc redis.UniversalClient, ourIndex int, primaryCount int) error {
+func ConfigureReplicaNode(ctx context.Context, vc valkey.Client, ourIndex int, primaryCount int) error {
 	ourPrimary := ourIndex % primaryCount
 
-	ourPrimaryAddr := net.JoinHostPort(nodeName(ourPrimary), strconv.FormatInt(ValkeyPort, 10))
+	ourPrimaryIP, err := nodeIP(ourPrimary)
+	if err != nil {
+		return fmt.Errorf("failed to find IP for our primary: %w", err)
+	}
 
-	primaryClient := redis.NewClient(&redis.Options{
-		Addr: ourPrimaryAddr,
-	})
+	ourPrimaryAddr := net.JoinHostPort(ourPrimaryIP.String(), strconv.FormatInt(ValkeyPort, 10))
 
-	if err := WaitPing(ctx, primaryClient); err != nil {
+	if _, err := WaitPing(ctx, ourPrimaryAddr); err != nil {
 		return fmt.Errorf("failed to wait for our primary %q to come alive: %w", ourPrimaryAddr, err)
 	}
 
@@ -150,11 +178,24 @@ func ConfigureReplicaNode(ctx context.Context, rc redis.UniversalClient, ourInde
 		slog.String("primary", ourPrimaryAddr),
 	)
 
-	return rc.ClusterReplicate(ctx, ourPrimaryAddr).Err()
+	return vc.Do(ctx, vc.B().ClusterReplicate().NodeId(ourPrimaryAddr).Build()).Error()
 }
 
 func nodeName(index int) string {
-	return NodeNamePrefix + strconv.FormatInt(int64(index), 10)
+	return NodeNamePrefix + strconv.FormatInt(int64(index), 10) + NodeNameSuffix
+}
+
+func nodeIP(index int) (net.IP, error) {
+	ips, err := net.LookupIP(nodeName(index))
+	if err != nil {
+		return nil, fmt.Errorf("failed to lookup IP for %s: %w", nodeName(index), err)
+	}
+
+	if len(ips) < 1 {
+		return nil, fmt.Errorf("no IPs found for %s", nodeName(index))
+	}
+
+	return ips[0], nil
 }
 
 func slotSize(primaryCount int) int {
